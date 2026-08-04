@@ -22,6 +22,12 @@ Only dates literally published in those tables are used — nothing is projected
 from business-day rules. When a source publishes its next year, the new dates
 appear here automatically.
 
+Both sites refuse non-browser clients (captcha wall / CDN 403), so when a
+direct fetch is refused the generator reads the newest [Wayback Machine](https://web.archive.org)
+snapshot of the same official page instead, and requests a fresh capture each
+run so snapshots stay days old. If the newest usable snapshot is more than
+120 days old the job fails loudly instead of trusting stale dates.
+
 ## How it updates
 
 A GitHub Actions cron job ([update-calendar.yml](.github/workflows/update-calendar.yml))
