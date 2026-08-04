@@ -4,28 +4,34 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe
+      - name: Probe wayback flow
         run: |
           pip -q install requests
           python - <<'EOF'
-          import requests
-          H = {
-              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              "Accept-Language": "en-US,en;q=0.9",
-          }
-          urls = [
-              "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/",
-              "https://www.bls.gov/schedule/news_release/jolts.htm",
-              "https://www.bls.gov/schedule/news_release/bls.ics",
-          ]
-          for u in urls:
+          import requests, time
+          UA = {"User-Agent": "econ-calendar/1.0 (github.com/AbodhGawande/econ-calendar)"}
+          ISM = "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/"
+          JOLTS = "https://www.bls.gov/schedule/news_release/jolts.htm"
+
+          # 1. Can we trigger a fresh capture? (best-effort)
+          for u in (ISM, JOLTS):
               try:
-                  r = requests.get(u, headers=H, timeout=30)
-                  body = r.text
-                  wall = "captcha" in body.lower() or "Access Denied" in body
-                  print(f"{u}\n  status={r.status_code} len={len(body)} bot_wall={wall}")
-                  print("  head:", body[:180].replace("\n", " "))
+                  r = requests.get(f"https://web.archive.org/save/{u}", headers=UA, timeout=120)
+                  print("SPN", u.split("/")[2], r.status_code, len(r.text))
               except Exception as e:
-                  print(f"{u}\n  EXC {e}")
+                  print("SPN", u.split("/")[2], "EXC", type(e).__name__, str(e)[:100])
+
+          # 2. CDX newest snapshots
+          for u in (ISM, JOLTS):
+              r = requests.get("https://web.archive.org/cdx/search/cdx",
+                               params={"url": u, "output": "json", "filter": "statuscode:200",
+                                       "limit": "-4", "fl": "timestamp"},
+                               headers=UA, timeout=60)
+              print("CDX", u.split("/")[2], r.status_code, r.json())
+
+          # 3. Raw snapshot fetch (id_ = original bytes)
+          r = requests.get(f"https://web.archive.org/web/20260415040000id_/{ISM}", headers=UA, timeout=60)
+          print("SNAP ism", r.status_code, len(r.text), "Manufacturing PMI" in r.text, "captcha" in r.text.lower())
+          r = requests.get(f"https://web.archive.org/web/20260612174939id_/{JOLTS}", headers=UA, timeout=60)
+          print("SNAP jolts", r.status_code, len(r.text), "Reference Month" in r.text, "Access Denied" in r.text)
           EOF
