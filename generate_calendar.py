@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Generate us-econ-ism-jolts.ics from the official ISM and BLS schedule pages.
+
+Only dates literally published in the source tables are used — no projection.
+If anything about a source looks wrong, this script exits nonzero so the
+GitHub Actions job fails visibly instead of publishing a bad calendar.
+
+For local testing without network access:
+    python generate_calendar.py --ism-file ism.html --jolts-file jolts.html
+"""
+
+import argparse
+import re
+import sys
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+import requests
+from bs4 import BeautifulSoup
+
+ISM_URL = "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/"
+JOLTS_URL = "https://www.bls.gov/schedule/news_release/jolts.htm"
+OUTPUT_FILE = "us-econ-ism-jolts.ics"
+
+EASTERN = ZoneInfo("America/New_York")
+RELEASE_TIME = time(10, 0)
+EVENT_MINUTES = 30
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+}
+
+
+def fail(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def fetch(url):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=60)
+    except requests.RequestException as exc:
+        fail(f"could not fetch {url}: {exc}")
+    if resp.status_code != 200:
+        fail(f"{url} returned HTTP {resp.status_code} — source blocked or down, refusing to guess")
+    text = resp.text
+    if "captcha" in text.lower() or "Access Denied" in text:
+        fail(f"{url} served a bot-block page instead of the schedule — refusing to guess")
+    return text
+
+
+def parse_month_year(text):
+    """'January 2026' -> (2026, 1), else None."""
+    m = re.match(r"^\s*([A-Za-z]+)\s+(\d{4})\s*$", text)
+    if not m or m.group(1).lower() not in MONTHS:
+        return None
+    return int(m.group(2)), MONTHS[m.group(1).lower()]
+
+
+def prev_month(year, month):
+    return (year - 1, 12) if month == 1 else (year, month - 1)
+
+
+def month_label(year, month):
+    return date(year, month, 1).strftime("%b %Y")
+
+
+def parse_ism(html):
+    """Return events from the ISM release-dates table.
+
+    Each row names the RELEASE month ('September 2026') with the day of month
+    for each report; the data covered is the previous month (verified against
+    the page's own footnotes, e.g. the Sep 1 release covers Aug data).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    events = []
+    for table in soup.find_all("table"):
+        header = table.find("tr")
+        if header is None:
+            continue
+        header_text = header.get_text(" ")
+        if "Manufacturing" not in header_text or "Services" not in header_text:
+            continue
+        for row in table.find_all("tr")[1:]:
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 3:
+                continue
+            label = cells[0].get_text(" ", strip=True)
+            if "supply chain planning forecast" in label.lower():
+                continue
+            ym = parse_month_year(label)
+            if ym is None:
+                fail(f"ISM table has an unrecognized month row: {label!r}")
+            year, month = ym
+            ref_year, ref_month = prev_month(year, month)
+            for cell, series, slug in ((cells[1], "ISM Manufacturing PMI", "ism-mfg"),
+                                       (cells[2], "ISM Services PMI", "ism-svc")):
+                day_text = re.sub(r"[*®]", "", cell.get_text(" ", strip=True)).strip()
+                if not day_text.isdigit():
+                    fail(f"ISM {series} cell for {label} is not a plain day number: {day_text!r}")
+                try:
+                    release = date(year, month, int(day_text))
+                except ValueError:
+                    fail(f"ISM {series} day {day_text} is invalid for {label}")
+                events.append({
+                    "title": f"{series} ({month_label(ref_year, ref_month)} data)",
+                    "date": release,
+                    "uid": f"{slug}-{release:%Y%m%d}@econ-cal",
+                })
+    if not events:
+        fail("ISM page parsed but no release rows found — page layout may have changed")
+    return events
+
+
+def parse_jolts(html):
+    """Return events from the BLS JOLTS schedule table."""
+    soup = BeautifulSoup(html, "html.parser")
+    events = []
+    for table in soup.find_all("table"):
+        header = table.find("tr")
+        if header is None or "Reference Month" not in header.get_text(" "):
+            continue
+        for row in table.find_all("tr")[1:]:
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 3:
+                continue
+            ref_text = cells[0].get_text(" ", strip=True)
+            date_text = cells[1].get_text(" ", strip=True)
+            time_text = cells[2].get_text(" ", strip=True)
+            ym = parse_month_year(ref_text)
+            if ym is None:
+                fail(f"JOLTS table has an unrecognized reference month: {ref_text!r}")
+            try:
+                release = datetime.strptime(date_text.replace(".", ""), "%b %d, %Y").date()
+            except ValueError:
+                fail(f"JOLTS release date {date_text!r} did not parse")
+            if time_text.upper().replace(" ", "") != "10:00AM":
+                fail(f"JOLTS release time is {time_text!r}, expected 10:00 AM — check the source")
+            events.append({
+                "title": f"JOLTS Job Openings ({month_label(*ym)} data)",
+                "date": release,
+                "uid": f"jolts-{release:%Y%m%d}@econ-cal",
+            })
+    if not events:
+        fail("JOLTS page parsed but no schedule rows found — page layout may have changed")
+    return events
+
+
+VTIMEZONE = """BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:DAYLIGHT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+TZNAME:EDT
+DTSTART:19700308T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+TZNAME:EST
+DTSTART:19701101T020000
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU
+END:STANDARD
+END:VTIMEZONE"""
+
+
+def build_ics(events):
+    """Deterministic ICS text: same events in -> byte-identical file out."""
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//econ-calendar//ISM-JOLTS//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:US Econ — ISM & JOLTS",
+        "X-WR-TIMEZONE:America/New_York",
+    ]
+    lines.extend(VTIMEZONE.split("\n"))
+    for ev in sorted(events, key=lambda e: (e["date"], e["uid"])):
+        start = datetime.combine(ev["date"], RELEASE_TIME)
+        end = start + timedelta(minutes=EVENT_MINUTES)
+        stamp = start.replace(tzinfo=EASTERN).astimezone(ZoneInfo("UTC"))
+        lines.extend([
+            "BEGIN:VEVENT",
+            f"UID:{ev['uid']}",
+            f"DTSTAMP:{stamp:%Y%m%dT%H%M%SZ}",
+            f"DTSTART;TZID=America/New_York:{start:%Y%m%dT%H%M%S}",
+            f"DTEND;TZID=America/New_York:{end:%Y%m%dT%H%M%S}",
+            f"SUMMARY:{ev['title']}",
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            f"DESCRIPTION:{ev['title']}",
+            "TRIGGER:-PT15M",
+            "END:VALARM",
+            "END:VEVENT",
+        ])
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def validate(ics_bytes):
+    """Parse the generated file back and check every invariant. Any failure
+    exits nonzero so a broken file is never committed."""
+    from icalendar import Calendar
+
+    try:
+        cal = Calendar.from_ical(ics_bytes)
+    except Exception as exc:
+        fail(f"generated ICS does not parse: {exc}")
+    uids = []
+    count = 0
+    for comp in cal.walk("VEVENT"):
+        count += 1
+        dtstart = comp["DTSTART"].dt
+        if dtstart.tzinfo is None or dtstart.astimezone(EASTERN).time() != RELEASE_TIME:
+            fail(f"event {comp['UID']} is not at 10:00 America/New_York: {dtstart}")
+        if dtstart.weekday() >= 5:
+            fail(f"event {comp['UID']} falls on a weekend: {dtstart:%A %Y-%m-%d}")
+        uids.append(str(comp["UID"]))
+    if count == 0:
+        fail("generated ICS has zero events")
+    if len(uids) != len(set(uids)):
+        fail("generated ICS has duplicate UIDs")
+    print(f"Validation passed: {count} events, all 10:00 ET weekdays, UIDs unique.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ism-file", help="local HTML file instead of fetching the ISM page")
+    ap.add_argument("--jolts-file", help="local HTML file instead of fetching the BLS page")
+    args = ap.parse_args()
+
+    ism_html = open(args.ism_file, encoding="utf-8").read() if args.ism_file else fetch(ISM_URL)
+    jolts_html = open(args.jolts_file, encoding="utf-8").read() if args.jolts_file else fetch(JOLTS_URL)
+
+    events = parse_ism(ism_html) + parse_jolts(jolts_html)
+
+    cutoff = date.today() - timedelta(days=30)
+    kept = [e for e in events if e["date"] >= cutoff]
+    dropped = len(events) - len(kept)
+    for prefix in ("ism-mfg", "ism-svc", "jolts"):
+        if not any(e["uid"].startswith(prefix) for e in kept):
+            fail(f"no upcoming events for series {prefix} — refusing to publish a partial calendar")
+
+    print(f"Parsed {len(events)} events ({dropped} older than 30 days dropped):")
+    for ev in sorted(kept, key=lambda e: e["date"]):
+        print(f"  {ev['date']:%Y-%m-%d} {ev['date']:%a} 10:00 ET  {ev['title']}")
+
+    ics = build_ics(kept)
+    validate(ics.encode("utf-8"))
+    with open(OUTPUT_FILE, "w", encoding="utf-8", newline="") as f:
+        f.write(ics)
+    print(f"Wrote {OUTPUT_FILE} with {len(kept)} events.")
+
+
+if __name__ == "__main__":
+    main()
