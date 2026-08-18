@@ -3,6 +3,7 @@ name: Update calendar
 on:
   schedule:
     - cron: "0 12 * * 1"   # every Monday 12:00 UTC
+    - cron: "0 12 * * 4"   # Thursday backup attempt (no-op commit-wise if Monday succeeded)
   workflow_dispatch:
 
 permissions:

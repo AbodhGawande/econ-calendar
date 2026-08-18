@@ -31,8 +31,10 @@ run so snapshots stay days old. If the newest usable snapshot is more than
 ## How it updates
 
 A GitHub Actions cron job ([update-calendar.yml](.github/workflows/update-calendar.yml))
-re-runs [generate_calendar.py](generate_calendar.py) every Monday 12:00 UTC and
-commits `us-econ-ism-jolts.ics` only when its content changed. The generated file
+re-runs [generate_calendar.py](generate_calendar.py) every Monday and Thursday
+12:00 UTC (Thursday is a backup attempt in case of an archive outage) and
+commits `us-econ-ism-jolts.ics` only when its content changed. Archive requests
+are retried 3 times with 60s backoff before giving up. The generated file
 is validated (parses, events > 0, all 10:00 ET, weekdays only, unique UIDs)
 before any commit; on any fetch/parse/validation failure the job fails visibly
 and commits nothing.

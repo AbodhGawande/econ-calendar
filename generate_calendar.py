@@ -61,6 +61,22 @@ def looks_walled(text):
     return "captcha" in text.lower() or "Access Denied" in text
 
 
+WB_HEADERS = {"User-Agent": "econ-calendar/1.0 (github.com/AbodhGawande/econ-calendar)"}
+
+
+def wb_get(url, desc, timeout=60, params=None):
+    """GET against web.archive.org with retries — the archive has flaky spells
+    (e.g. the Aug 2026 outage) where some requests time out and others work."""
+    for attempt in range(1, 4):
+        try:
+            return requests.get(url, headers=WB_HEADERS, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            if attempt == 3:
+                raise
+            print(f"{desc}: attempt {attempt}/3 failed ({exc}); retrying in 60s...")
+            time_mod.sleep(60)
+
+
 def fetch(url, content_marker):
     """Fetch an official page: direct first, Wayback Machine snapshot fallback.
 
@@ -77,22 +93,18 @@ def fetch(url, content_marker):
     except requests.RequestException as exc:
         print(f"Direct fetch of {url} failed ({exc}); using Wayback Machine.")
 
-    wb_headers = {"User-Agent": "econ-calendar/1.0 (github.com/AbodhGawande/econ-calendar)"}
-
     # Ask the archive for a fresh capture (best-effort; no trailing slash —
     # the /save endpoint 404s on trailing-slash URLs).
     try:
-        requests.get(f"https://web.archive.org/save/{url.rstrip('/')}",
-                     headers=wb_headers, timeout=150)
+        wb_get(f"https://web.archive.org/save/{url.rstrip('/')}", "save-page-now", timeout=150)
         time_mod.sleep(45)  # give the capture a chance to be indexed
     except requests.RequestException as exc:
         print(f"Save-page-now request failed ({exc}); using existing snapshots.")
 
     try:
-        resp = requests.get("https://web.archive.org/cdx/search/cdx",
-                            params={"url": url, "output": "json", "fl": "timestamp",
-                                    "filter": "statuscode:200", "limit": "-8"},
-                            headers=wb_headers, timeout=60)
+        resp = wb_get("https://web.archive.org/cdx/search/cdx", "CDX lookup",
+                      params={"url": url, "output": "json", "fl": "timestamp",
+                              "filter": "statuscode:200", "limit": "-8"})
         resp.raise_for_status()
         rows = resp.json()
     except (requests.RequestException, ValueError) as exc:
@@ -103,10 +115,11 @@ def fetch(url, content_marker):
 
     for ts in timestamps:
         try:
-            snap = requests.get(f"https://web.archive.org/web/{ts}id_/{url}",
-                                headers=wb_headers, timeout=60)
-        except requests.RequestException:
-            continue
+            snap = wb_get(f"https://web.archive.org/web/{ts}id_/{url}", f"snapshot {ts}")
+        except requests.RequestException as exc:
+            # Connection-level failure after retries: the archive itself is
+            # down, so older snapshots (same host) won't fare better.
+            fail(f"Wayback Machine unreachable while fetching snapshots of {url}: {exc}")
         if snap.status_code != 200 or looks_walled(snap.text) or content_marker not in snap.text:
             continue
         snap_date = datetime.strptime(ts[:8], "%Y%m%d").date()
